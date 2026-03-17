@@ -32,6 +32,50 @@ var (
 	ErrMemoryLimitViolations   = errors.New("container(s) exceeded memory limits")
 )
 
+// isProjectRootAccessibleInDocker tests whether the project root is accessible via Docker
+// bind mounts by running a quick test container. On macOS with colima, paths outside $HOME
+// may not be shared with the VM.
+func isProjectRootAccessibleInDocker(ctx context.Context, projectRoot, goVersion string) bool {
+	cli, err := createDockerClient(ctx)
+	if err != nil {
+		return false
+	}
+	defer cli.Close()
+
+	imageName := "golang:" + goVersion
+
+	resp, err := cli.ContainerCreate(ctx, &container.Config{
+		Image:  imageName,
+		Cmd:    []string{"test", "-f", "/headscale/go.mod"},
+		Labels: map[string]string{"hi.type": "bind-mount-check"},
+	}, &container.HostConfig{
+		AutoRemove: false,
+		Binds:      []string{projectRoot + ":/headscale"},
+	}, nil, nil, "")
+	if err != nil {
+		return false
+	}
+
+	defer func() {
+		_ = cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+	}()
+
+	err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{})
+	if err != nil {
+		return false
+	}
+
+	statusCh, errCh := cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		return err == nil
+	case status := <-statusCh:
+		return status.StatusCode == 0
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // runTestContainer executes integration tests in a Docker container.
 //
 //nolint:gocyclo // complex test orchestration function
@@ -216,7 +260,9 @@ func testRunnerImage(config *RunConfig) string {
 
 // buildTestCommand supports both go test and its compiled test binary flags.
 func buildTestCommand(config *RunConfig) []string {
-	cmd := []string{"go", "test", "./..."}
+	// The project root is bind-mounted at /headscale, so the package path is
+	// qualified to keep this to the integration suite.
+	cmd := []string{"go", "test", "./integration/..."}
 	flagPrefix := "-"
 
 	if config.TestBinary != "" {
@@ -281,7 +327,7 @@ func createTestContainer(ctx context.Context, cli *client.Client, config *RunCon
 		Image:      testRunnerImage(config),
 		Cmd:        testCmd,
 		Env:        env,
-		WorkingDir: projectRoot + "/integration",
+		WorkingDir: "/headscale",
 		Tty:        true,
 		Labels: map[string]string{
 			"hi.run-id":    runID,
@@ -303,7 +349,7 @@ func createTestContainer(ctx context.Context, cli *client.Client, config *RunCon
 	}
 
 	binds := []string{
-		fmt.Sprintf("%s:%s", projectRoot, projectRoot),
+		projectRoot + ":/headscale",
 		dockerSocketPath + ":/var/run/docker.sock",
 		logsDir + ":/tmp/control",
 	}
