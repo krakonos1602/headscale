@@ -33,12 +33,13 @@ const (
 )
 
 var (
-	errOidcMutuallyExclusive     = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
-	errServerURLSuffix           = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
-	errServerURLSame             = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
-	errInvalidPKCEMethod         = errors.New("pkce.method must be either 'plain' or 'S256'")
-	ErrNoPrefixConfigured        = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
-	ErrInvalidAllocationStrategy = errors.New("invalid prefix allocation strategy")
+	errOidcMutuallyExclusive       = errors.New("oidc_client_secret and oidc_client_secret_path are mutually exclusive")
+	errCloudflareMutuallyExclusive = errors.New("dns.challenge.cloudflare.api_token and dns.challenge.cloudflare.api_token_path are mutually exclusive")
+	errServerURLSuffix             = errors.New("server_url cannot be part of base_domain in a way that could make the DERP and headscale server unreachable")
+	errServerURLSame               = errors.New("server_url cannot use the same domain as base_domain in a way that could make the DERP and headscale server unreachable")
+	errInvalidPKCEMethod           = errors.New("pkce.method must be either 'plain' or 'S256'")
+	ErrNoPrefixConfigured          = errors.New("no IPv4 or IPv6 prefix configured, minimum one prefix is required")
+	ErrInvalidAllocationStrategy   = errors.New("invalid prefix allocation strategy")
 )
 
 type IPAllocationStrategy string
@@ -89,6 +90,8 @@ type Config struct {
 	// it can be used directly when sending Netmaps to clients.
 	TailcfgDNSConfig *tailcfg.DNSConfig
 
+	DNSChallenge DNSChallengeConfig
+
 	UnixSocket           string
 	UnixSocketPermission fs.FileMode
 
@@ -118,6 +121,27 @@ type DNSConfig struct {
 type Nameservers struct {
 	Global []string
 	Split  map[string][]string
+}
+
+type DNSChallengeConfig struct {
+	Provider   string
+	Cloudflare CloudflareDNSChallengeConfig
+	RateLimit  DNSChallengeRateLimitConfig
+}
+
+type CloudflareDNSChallengeConfig struct {
+	APIToken     string
+	APITokenPath string
+	ZoneID       string
+	APIURL       string
+}
+
+type DNSChallengeRateLimitConfig struct {
+	Enabled      bool
+	GlobalRPS    float64
+	GlobalBurst  int
+	PerNodeRPS   float64
+	PerNodeBurst int
 }
 
 type SqliteConfig struct {
@@ -359,6 +383,14 @@ func LoadConfig(path string, isFile bool) error {
 	viper.SetDefault("dns.nameservers.global", []string{})
 	viper.SetDefault("dns.nameservers.split", map[string]string{})
 	viper.SetDefault("dns.search_domains", []string{})
+	viper.SetDefault("dns.challenge.provider", "")
+	viper.SetDefault("dns.challenge.cloudflare.api_url", "https://api.cloudflare.com/client/v4")
+	viper.SetDefault("dns.challenge.cloudflare.api_token_path", "")
+	viper.SetDefault("dns.challenge.rate_limit.enabled", true)
+	viper.SetDefault("dns.challenge.rate_limit.global_rps", 20.0)
+	viper.SetDefault("dns.challenge.rate_limit.global_burst", 40)
+	viper.SetDefault("dns.challenge.rate_limit.per_node_rps", 0.5)
+	viper.SetDefault("dns.challenge.rate_limit.per_node_burst", 5)
 
 	viper.SetDefault("derp.server.enabled", false)
 	viper.SetDefault("derp.server.verify_clients", true)
@@ -959,6 +991,39 @@ func LoadServerConfig() (*Config, error) {
 		return nil, err
 	}
 
+	dnsChallengeCloudflareAPIToken := strings.TrimSpace(viper.GetString("dns.challenge.cloudflare.api_token"))
+
+	dnsChallengeCloudflareAPITokenPath := strings.TrimSpace(viper.GetString("dns.challenge.cloudflare.api_token_path"))
+	if dnsChallengeCloudflareAPITokenPath != "" && dnsChallengeCloudflareAPIToken != "" {
+		return nil, errCloudflareMutuallyExclusive
+	}
+
+	if dnsChallengeCloudflareAPITokenPath != "" {
+		secretBytes, err := os.ReadFile(os.ExpandEnv(dnsChallengeCloudflareAPITokenPath))
+		if err != nil {
+			return nil, err
+		}
+
+		dnsChallengeCloudflareAPIToken = strings.TrimSpace(string(secretBytes))
+	}
+
+	dnsChallengeConfig := DNSChallengeConfig{
+		Provider: viper.GetString("dns.challenge.provider"),
+		Cloudflare: CloudflareDNSChallengeConfig{
+			APIToken:     dnsChallengeCloudflareAPIToken,
+			APITokenPath: dnsChallengeCloudflareAPITokenPath,
+			ZoneID:       viper.GetString("dns.challenge.cloudflare.zone_id"),
+			APIURL:       viper.GetString("dns.challenge.cloudflare.api_url"),
+		},
+		RateLimit: DNSChallengeRateLimitConfig{
+			Enabled:      viper.GetBool("dns.challenge.rate_limit.enabled"),
+			GlobalRPS:    viper.GetFloat64("dns.challenge.rate_limit.global_rps"),
+			GlobalBurst:  viper.GetInt("dns.challenge.rate_limit.global_burst"),
+			PerNodeRPS:   viper.GetFloat64("dns.challenge.rate_limit.per_node_rps"),
+			PerNodeBurst: viper.GetInt("dns.challenge.rate_limit.per_node_burst"),
+		},
+	}
+
 	derpConfig := derpConfig()
 	logTailConfig := logtailConfig()
 	randomizeClientPort := viper.GetBool("randomize_client_port")
@@ -1024,6 +1089,7 @@ func LoadServerConfig() (*Config, error) {
 
 		DNSConfig:        dnsConfig,
 		TailcfgDNSConfig: dnsToTailcfgDNS(dnsConfig),
+		DNSChallenge:     dnsChallengeConfig,
 
 		ACMEEmail: viper.GetString("acme_email"),
 		ACMEURL:   viper.GetString("acme_url"),

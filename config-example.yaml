@@ -322,6 +322,29 @@ dns:
   # Headscale processes this file on each change.
   # extra_records_path: /var/lib/headscale/extra-records.json
 
+  # Optional ACME DNS-01 challenge provider used by tailscale serve https.
+  # This is used by /machine/set-dns for TXT challenge records.
+  # Keep provider empty to disable.
+  # challenge:
+  #   provider: cloudflare
+  #   cloudflare:
+  #     # Token with Zone DNS Edit permission for the selected zone.
+  #     api_token: ""
+  #     # Optional path to a file containing the API token.
+  #     # Mutually exclusive with api_token.
+  #     api_token_path: ""
+  #     # Cloudflare zone ID where TXT records should be created.
+  #     zone_id: ""
+  #     # Optional override for Cloudflare API URL.
+  #     api_url: "https://api.cloudflare.com/client/v4"
+  #   # Server-side protection for /machine/set-dns requests.
+  #   rate_limit:
+  #     enabled: true
+  #     global_rps: 20
+  #     global_burst: 40
+  #     per_node_rps: 0.5
+  #     per_node_burst: 5
+
 # Unix socket used for the CLI to connect without authentication
 # Note: for production you will want to set this to something like:
 unix_socket: /var/run/headscale/headscale.sock

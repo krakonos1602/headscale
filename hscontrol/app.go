@@ -100,6 +100,8 @@ type Headscale struct {
 
 	// Things that generate changes
 	extraRecordMan *dns.ExtraRecordsMan
+	dnsChallenge   dns.ChallengeProvider
+	setDNSLimiter  *setDNSRateLimiter
 	authProvider   AuthProvider
 	mapBatcher     *mapper.Batcher
 
@@ -138,6 +140,18 @@ func NewHeadscale(cfg *types.Config) (*Headscale, error) {
 		clientStreamsOpen: sync.WaitGroup{},
 		state:             s,
 	}
+
+	dnsChallenge, err := dns.NewChallengeProvider(cfg.DNSChallenge)
+	if err != nil && !errors.Is(err, dns.ErrDNSChallengeProviderDisabled) {
+		return nil, fmt.Errorf("initializing dns challenge provider: %w", err)
+	}
+
+	if errors.Is(err, dns.ErrDNSChallengeProviderDisabled) {
+		dnsChallenge = nil
+	}
+
+	app.dnsChallenge = dnsChallenge
+	app.setDNSLimiter = newSetDNSRateLimiter(cfg.DNSChallenge.RateLimit)
 
 	// Initialize ephemeral garbage collector
 	ephemeralGC := db.NewEphemeralGarbageCollector(func(ni types.NodeID) {

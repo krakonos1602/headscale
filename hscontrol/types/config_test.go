@@ -263,6 +263,47 @@ func TestReadConfig(t *testing.T) {
 	}
 }
 
+func TestDNSChallengeCloudflareAPITokenPath(t *testing.T) {
+	viper.Reset()
+
+	err := LoadConfig("testdata/base-domain-not-in-server-url.yaml", true)
+	require.NoError(t, err)
+
+	tmpDir := t.TempDir()
+	tokenPath := filepath.Join(tmpDir, "cloudflare.token")
+	err = os.WriteFile(tokenPath, []byte("token-from-file\n"), 0o600)
+	require.NoError(t, err)
+
+	viper.Set("dns.challenge.provider", "cloudflare")
+	viper.Set("dns.challenge.cloudflare.zone_id", "zone-id")
+	viper.Set("dns.challenge.cloudflare.api_token_path", tokenPath)
+
+	cfg, err := LoadServerConfig()
+	require.NoError(t, err)
+	assert.Equal(t, "token-from-file", cfg.DNSChallenge.Cloudflare.APIToken)
+	assert.Equal(t, tokenPath, cfg.DNSChallenge.Cloudflare.APITokenPath)
+}
+
+func TestDNSChallengeCloudflareAPITokenPathMutuallyExclusive(t *testing.T) {
+	viper.Reset()
+
+	err := LoadConfig("testdata/base-domain-not-in-server-url.yaml", true)
+	require.NoError(t, err)
+
+	tmpDir := t.TempDir()
+	tokenPath := filepath.Join(tmpDir, "cloudflare.token")
+	err = os.WriteFile(tokenPath, []byte("token-from-file\n"), 0o600)
+	require.NoError(t, err)
+
+	viper.Set("dns.challenge.provider", "cloudflare")
+	viper.Set("dns.challenge.cloudflare.zone_id", "zone-id")
+	viper.Set("dns.challenge.cloudflare.api_token", "inline-token")
+	viper.Set("dns.challenge.cloudflare.api_token_path", tokenPath)
+
+	_, err = LoadServerConfig()
+	require.ErrorIs(t, err, errCloudflareMutuallyExclusive)
+}
+
 func TestReadConfigFromEnv(t *testing.T) {
 	tests := []struct {
 		name      string

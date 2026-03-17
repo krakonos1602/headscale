@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -158,7 +159,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 		// client sends a [tailcfg.SetDNSRequest] to this endpoints and expect
 		// the server to create or update this DNS record "somewhere".
 		// It is typically a TXT record for an ACME challenge.
-		r.Post("/set-dns", ns.NotImplementedHandler)
+		r.Post("/set-dns", ns.SetDNSHandler)
 
 		// A patch of [tailcfg.SetDeviceAttributesRequest] to update device attributes.
 		// We currently do not support device attributes.
@@ -174,7 +175,7 @@ func (h *Headscale) NoiseUpgradeHandler(
 
 		// Asks the server if a feature is available and receive information about how to enable it.
 		// Gets a [tailcfg.QueryFeatureRequest] and returns a [tailcfg.QueryFeatureResponse].
-		r.Post("/feature/query", ns.NotImplementedHandler)
+		r.Post("/feature/query", ns.QueryFeatureHandler)
 
 		r.Post("/update-health", ns.NotImplementedHandler)
 
@@ -270,6 +271,194 @@ func rejectUnsupported(
 func (ns *noiseServer) NotImplementedHandler(writer http.ResponseWriter, req *http.Request) {
 	log.Trace().Caller().Str("path", req.URL.String()).Msg("not implemented handler hit")
 	http.Error(writer, "Not implemented yet", http.StatusNotImplemented)
+}
+
+// SetDNSHandler handles ACME DNS-01 TXT record upserts for certificate issuance.
+func (ns *noiseServer) SetDNSHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	if req.Method != http.MethodPost {
+		httpError(writer, errMethodNotAllowed)
+
+		return
+	}
+
+	if ns.headscale.dnsChallenge == nil {
+		httpError(writer, NewHTTPError(
+			http.StatusServiceUnavailable,
+			"dns challenge provider not configured",
+			nil,
+		))
+
+		return
+	}
+
+	var setReq tailcfg.SetDNSRequest
+
+	err := json.NewDecoder(req.Body).Decode(&setReq)
+	if err != nil {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "invalid set-dns payload", err))
+
+		return
+	}
+
+	if rejectUnsupported(writer, setReq.Version, ns.machineKey, setReq.NodeKey) {
+		return
+	}
+
+	if setReq.NodeKey.IsZero() {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "node key is required", nil))
+
+		return
+	}
+
+	nv, err := ns.getAndValidateNodeByNodeKey(setReq.NodeKey)
+	if err != nil {
+		httpError(writer, err)
+
+		return
+	}
+
+	if !ns.headscale.setDNSLimiter.Allow(nv.ID()) {
+		httpError(writer, NewHTTPError(
+			http.StatusTooManyRequests,
+			"set-dns rate limit exceeded",
+			nil,
+		))
+
+		return
+	}
+
+	if !strings.EqualFold(setReq.Type, "TXT") {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "only TXT records are supported", nil))
+
+		return
+	}
+
+	if setReq.Value == "" {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "value is required", nil))
+
+		return
+	}
+
+	if !strings.HasPrefix(strings.ToLower(setReq.Name), "_acme-challenge.") {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "only ACME challenge records are supported", nil))
+
+		return
+	}
+
+	certDomain, err := nv.GetFQDN(ns.headscale.cfg.BaseDomain)
+	if err != nil {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "node has no certificate domain", err))
+
+		return
+	}
+
+	certDomain = strings.TrimSuffix(certDomain, ".")
+
+	expectedName := "_acme-challenge." + certDomain
+	if !strings.EqualFold(setReq.Name, expectedName) {
+		httpError(writer, NewHTTPError(http.StatusForbidden, "requested DNS name is not allowed for this node", nil))
+
+		return
+	}
+
+	err = ns.headscale.dnsChallenge.UpsertTXT(req.Context(), setReq.Name, setReq.Value)
+	if err != nil {
+		httpError(writer, NewHTTPError(http.StatusBadGateway, "failed to upsert DNS challenge record", err))
+
+		return
+	}
+
+	log.Info().
+		Uint64("node.id", nv.ID().Uint64()).
+		Str("name", setReq.Name).
+		Msg("set-dns TXT challenge record upserted")
+
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(writer).Encode(&tailcfg.SetDNSResponse{})
+	if err != nil {
+		log.Error().Caller().Err(err).Msg("failed to encode SetDNSResponse")
+		return
+	}
+
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+// QueryFeatureHandler returns feature enablement status for CLI interactive flows.
+func (ns *noiseServer) QueryFeatureHandler(
+	writer http.ResponseWriter,
+	req *http.Request,
+) {
+	if req.Method != http.MethodPost {
+		httpError(writer, errMethodNotAllowed)
+
+		return
+	}
+
+	var featureReq tailcfg.QueryFeatureRequest
+
+	err := json.NewDecoder(req.Body).Decode(&featureReq)
+	if err != nil {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "invalid feature query payload", err))
+
+		return
+	}
+
+	if featureReq.NodeKey.IsZero() {
+		httpError(writer, NewHTTPError(http.StatusBadRequest, "node key is required", nil))
+
+		return
+	}
+
+	_, err = ns.getAndValidateNodeByNodeKey(featureReq.NodeKey)
+	if err != nil {
+		httpError(writer, err)
+
+		return
+	}
+
+	feature := strings.ToLower(strings.TrimSpace(featureReq.Feature))
+	hasDNSChallenge := strings.TrimSpace(ns.headscale.cfg.DNSChallenge.Provider) != ""
+
+	resp := tailcfg.QueryFeatureResponse{}
+
+	switch feature {
+	case "serve":
+		if hasDNSChallenge {
+			resp.Complete = true
+		} else {
+			resp.Complete = false
+			resp.ShouldWait = false
+			resp.Text = "HTTPS serve requires dns.challenge.provider to be configured on the headscale server."
+		}
+	case "funnel":
+		resp.Complete = false
+		resp.ShouldWait = false
+		resp.Text = "Funnel is not supported by this headscale instance."
+	default:
+		resp.Complete = false
+		resp.ShouldWait = false
+		resp.Text = "Feature is not supported by this headscale instance."
+	}
+
+	writer.Header().Set("Content-Type", "application/json; charset=utf-8")
+	writer.WriteHeader(http.StatusOK)
+
+	err = json.NewEncoder(writer).Encode(&resp)
+	if err != nil {
+		log.Error().Caller().Err(err).Msg("failed to encode QueryFeatureResponse")
+		return
+	}
+
+	if flusher, ok := writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func urlParam[T any](req *http.Request, key string) (T, error) {
@@ -648,7 +837,11 @@ func (ns *noiseServer) RegistrationHandler(
 // getAndValidateNode retrieves the node from the database using the NodeKey
 // and validates that it matches the MachineKey from the Noise session.
 func (ns *noiseServer) getAndValidateNode(mapRequest tailcfg.MapRequest) (types.NodeView, error) {
-	nv, ok := ns.headscale.state.GetNodeByNodeKey(mapRequest.NodeKey)
+	return ns.getAndValidateNodeByNodeKey(mapRequest.NodeKey)
+}
+
+func (ns *noiseServer) getAndValidateNodeByNodeKey(nodeKey key.NodePublic) (types.NodeView, error) {
+	nv, ok := ns.headscale.state.GetNodeByNodeKey(nodeKey)
 	if !ok {
 		return types.NodeView{}, NewHTTPError(http.StatusNotFound, "node not found", nil)
 	}

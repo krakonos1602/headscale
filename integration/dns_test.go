@@ -221,3 +221,95 @@ func TestResolveMagicDNSExtraRecordsPath(t *testing.T) {
 		assertCommandOutputContains(t, client, []string{"dig", "copy.myvpn.example.com"}, "8.8.8.8")
 	}
 }
+
+func TestMagicDNSCertDomainsWithoutHTTPSCapability(t *testing.T) {
+	IntegrationSkip(t)
+
+	spec := ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{"user1"},
+	}
+
+	scenario, err := NewScenario(spec)
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv([]tsic.Option{}, hsic.WithTestName("dns-certdomains-no-https"))
+	requireNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	for _, client := range allClients {
+		expectedCertDomain := client.Hostname() + ".headscale.net"
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			nm, err := client.Netmap()
+			assert.NoError(c, err)
+
+			if nm == nil {
+				return
+			}
+
+			assert.Contains(c, nm.DNS.CertDomains, expectedCertDomain)
+			assert.False(c, nm.HasSelfCapability(tailcfg.CapabilityHTTPS))
+		}, 30*time.Second, 2*time.Second, "cert domains should be present and HTTPS capability should be disabled by default")
+	}
+}
+
+func TestMagicDNSCertDomainsWithHTTPSCapability(t *testing.T) {
+	IntegrationSkip(t)
+
+	spec := ScenarioSpec{
+		NodesPerUser: 1,
+		Users:        []string{"user1"},
+	}
+
+	scenario, err := NewScenario(spec)
+
+	require.NoError(t, err)
+	defer scenario.ShutdownAssertNoPanics(t)
+
+	err = scenario.CreateHeadscaleEnv(
+		[]tsic.Option{},
+		hsic.WithTestName("dns-certdomains-with-https"),
+		hsic.WithConfigEnv(map[string]string{
+			"HEADSCALE_DNS_CHALLENGE_PROVIDER":                  "cloudflare",
+			"HEADSCALE_DNS_CHALLENGE_CLOUDFLARE_ZONE_ID":        "test-zone-id",
+			"HEADSCALE_DNS_CHALLENGE_CLOUDFLARE_API_TOKEN":      "test-token",
+			"HEADSCALE_DNS_CHALLENGE_CLOUDFLARE_API_URL":        "http://127.0.0.1:9",
+			"HEADSCALE_DNS_CHALLENGE_RATE_LIMIT_ENABLED":        "true",
+			"HEADSCALE_DNS_CHALLENGE_RATE_LIMIT_GLOBAL_RPS":     "20",
+			"HEADSCALE_DNS_CHALLENGE_RATE_LIMIT_GLOBAL_BURST":   "40",
+			"HEADSCALE_DNS_CHALLENGE_RATE_LIMIT_PER_NODE_RPS":   "0.5",
+			"HEADSCALE_DNS_CHALLENGE_RATE_LIMIT_PER_NODE_BURST": "5",
+		}),
+	)
+	requireNoErrHeadscaleEnv(t, err)
+
+	allClients, err := scenario.ListTailscaleClients()
+	requireNoErrListClients(t, err)
+
+	err = scenario.WaitForTailscaleSync()
+	requireNoErrSync(t, err)
+
+	for _, client := range allClients {
+		expectedCertDomain := client.Hostname() + ".headscale.net"
+
+		assert.EventuallyWithT(t, func(c *assert.CollectT) {
+			nm, err := client.Netmap()
+			assert.NoError(c, err)
+
+			if nm == nil {
+				return
+			}
+
+			assert.Contains(c, nm.DNS.CertDomains, expectedCertDomain)
+			assert.True(c, nm.HasSelfCapability(tailcfg.CapabilityHTTPS))
+		}, 30*time.Second, 2*time.Second, "cert domains should be present and HTTPS capability should be enabled when DNS challenge provider is configured")
+	}
+}
