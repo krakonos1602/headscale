@@ -162,6 +162,11 @@ func generateDNSConfig(
 		}
 	}
 
+	if certDomain, err := node.GetFQDN(cfg.BaseDomain); err == nil {
+		dnsConfig.CertDomains = []string{strings.TrimSuffix(certDomain, ".")}
+	}
+
+
 	return dnsConfig
 }
 

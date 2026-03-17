@@ -35,14 +35,16 @@ func TestDNSConfigMapResponse(t *testing.T) {
 				Domains: []string{
 					"foobar.headscale.net",
 				},
-				Proxied: true,
+				CertDomains: []string{"test-get-shared-nodes-1.foobar.headscale.net"},
+				Proxied:     true,
 			},
 		},
 		{
 			magicDNS: false,
 			want: &tailcfg.DNSConfig{
-				Domains: []string{"foobar.headscale.net"},
-				Proxied: false,
+				Domains:     []string{"foobar.headscale.net"},
+				CertDomains: []string{"test-get-shared-nodes-1.foobar.headscale.net"},
+				Proxied:     false,
 			},
 		},
 	}
@@ -51,8 +53,9 @@ func TestDNSConfigMapResponse(t *testing.T) {
 		t.Run(fmt.Sprintf("with-magicdns-%v", tt.magicDNS), func(t *testing.T) {
 			mach := func(hostname, username string, userid uint) *types.Node {
 				return &types.Node{
-					Hostname: hostname,
-					UserID:   new(userid),
+					Hostname:  hostname,
+					GivenName: "test-get-shared-nodes-1",
+					UserID:    new(userid),
 					User: &types.User{
 						Name: username,
 					},
@@ -71,6 +74,7 @@ func TestDNSConfigMapResponse(t *testing.T) {
 
 			got := generateDNSConfig(
 				&types.Config{
+					BaseDomain:       baseDomain,
 					TailcfgDNSConfig: &dnsConfigOrig,
 				},
 				nodeInShared1.View(),
