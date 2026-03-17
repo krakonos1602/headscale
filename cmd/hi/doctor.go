@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/juanfont/headscale/integration/dockertestutil"
@@ -50,6 +52,7 @@ func runDoctorCheck(ctx context.Context) error {
 		results = append(results, checkDockerSocket(ctx))
 		results = append(results, checkDockerHubCredentials())
 		results = append(results, checkGolangImage(ctx))
+		results = append(results, checkProjectRootBindMount(ctx))
 	}
 
 	// Check 3: Go installation
@@ -384,6 +387,43 @@ func checkRequiredFiles(ctx context.Context) DoctorResult {
 		Name:    "Required Files",
 		Status:  statusPass,
 		Message: "All required files found",
+	}
+}
+
+// checkProjectRootBindMount verifies that Docker bind mounts work for the project root.
+// On macOS with colima, paths outside $HOME (e.g., on external drives) are not shared
+// with the Linux VM, causing bind mounts to produce empty directories.
+func checkProjectRootBindMount(ctx context.Context) DoctorResult {
+	pwd, err := os.Getwd()
+	if err != nil {
+		return DoctorResult{
+			Name:    "Project Root Bind Mount",
+			Status:  "WARN",
+			Message: "Cannot determine working directory",
+		}
+	}
+
+	projectRoot := findProjectRoot(pwd)
+	goVersion := detectGoVersion()
+
+	if isProjectRootAccessibleInDocker(ctx, projectRoot, goVersion) {
+		return DoctorResult{
+			Name:    "Project Root Bind Mount",
+			Status:  "PASS",
+			Message: fmt.Sprintf("Project root %s is accessible via Docker bind mount", projectRoot),
+		}
+	}
+
+	return DoctorResult{
+		Name:    "Project Root Bind Mount",
+		Status:  "WARN",
+		Message: fmt.Sprintf("Project root %s is NOT accessible via Docker bind mount (tests will fail)", projectRoot),
+		Suggestions: []string{
+			"On macOS with colima, paths outside $HOME require explicit mount configuration.",
+			"Add the path to colima mounts in ~/.colima/default/colima.yaml:",
+			fmt.Sprintf("  mounts:\n    - location: %s\n      writable: true", filepath.Dir(projectRoot)),
+			"Then restart colima: colima stop && colima start",
+		},
 	}
 }
 
