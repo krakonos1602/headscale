@@ -1426,6 +1426,9 @@ func (nv NodeView) TailNode(
 		nodecap.SSH:                     []tailcfg.RawMessage{},
 		nodecap.SSHEnvironmentVariables: []tailcfg.RawMessage{},
 	}
+	if strings.TrimSpace(cfg.DNSChallenge.Provider) != "" {
+		capMap[tailcfg.CapabilityHTTPS] = []tailcfg.RawMessage{}
+	}
 
 	if cfg.Taildrop.Enabled {
 		capMap[tailcfg.CapabilityFileSharing] = []tailcfg.RawMessage{}
