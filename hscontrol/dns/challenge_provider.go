@@ -35,6 +35,7 @@ const (
 	defaultTXTTTLSeconds           = 120
 	defaultPropagationTimeout      = 120 * time.Second
 	defaultPropagationPollInterval = 5 * time.Second
+	defaultCleanupDelay            = 10 * time.Minute
 	dnsLookupTimeout               = 10 * time.Second
 )
 
@@ -73,6 +74,12 @@ type cloudflareProvider struct {
 	apiBase *url.URL
 	zoneID  string
 	token   string
+
+	propagationResolvers    []string
+	propagationTimeout      time.Duration
+	propagationPollInterval time.Duration
+	cleanupDelay            time.Duration
+	lookupTXT               func(context.Context, string, string) ([]string, error)
 }
 
 func newCloudflareProvider(cfg types.CloudflareDNSChallengeConfig) (ChallengeProvider, error) {
@@ -98,9 +105,14 @@ func newCloudflareProvider(cfg types.CloudflareDNSChallengeConfig) (ChallengePro
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		apiBase: parsed,
-		zoneID:  cfg.ZoneID,
-		token:   cfg.APIToken,
+		apiBase:                 parsed,
+		zoneID:                  cfg.ZoneID,
+		token:                   cfg.APIToken,
+		propagationResolvers:    propagationResolvers,
+		propagationTimeout:      defaultPropagationTimeout,
+		propagationPollInterval: defaultPropagationPollInterval,
+		cleanupDelay:            defaultCleanupDelay,
+		lookupTXT:               lookupTXTAt,
 	}, nil
 }
 
@@ -112,6 +124,7 @@ func (p *cloudflareProvider) UpsertTXT(ctx context.Context, fqdn, value string) 
 
 	// Check if the exact value already exists.
 	alreadyExists := false
+
 	for _, rec := range records {
 		if rec.Content == value {
 			alreadyExists = true
@@ -138,6 +151,8 @@ func (p *cloudflareProvider) UpsertTXT(ctx context.Context, fqdn, value string) 
 			return err
 		}
 	}
+
+	p.scheduleCleanup(ctx, fqdn, value)
 
 	// Wait for DNS propagation before returning.
 	// The Tailscale client calls ACME Accept immediately after SetDNS returns,
@@ -285,18 +300,18 @@ func (p *cloudflareProvider) waitForPropagation(
 ) error {
 	log.Info().
 		Str("fqdn", fqdn).
-		Dur("timeout", defaultPropagationTimeout).
+		Dur("timeout", p.propagationTimeout).
 		Msg("waiting for DNS propagation of ACME challenge TXT record")
 
-	deadline := time.Now().Add(defaultPropagationTimeout)
+	deadline := time.Now().Add(p.propagationTimeout)
 
 	for time.Now().Before(deadline) {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 
-		for _, server := range propagationResolvers {
-			found, err := lookupTXTAt(ctx, fqdn, server)
+		for _, server := range p.propagationResolvers {
+			found, err := p.lookupTXT(ctx, fqdn, server)
 			if err != nil {
 				continue
 			}
@@ -314,7 +329,7 @@ func (p *cloudflareProvider) waitForPropagation(
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(defaultPropagationPollInterval):
+		case <-time.After(p.propagationPollInterval):
 		}
 	}
 
@@ -322,8 +337,57 @@ func (p *cloudflareProvider) waitForPropagation(
 		"%w: TXT record %q not visible via public DNS after %s",
 		ErrDNSPropagationTimeout,
 		fqdn,
-		defaultPropagationTimeout,
+		p.propagationTimeout,
 	)
+}
+
+func (p *cloudflareProvider) scheduleCleanup(ctx context.Context, fqdn, value string) {
+	go func(parent context.Context) {
+		timer := time.NewTimer(p.cleanupDelay)
+		defer timer.Stop()
+
+		<-timer.C
+
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(parent), 30*time.Second)
+		defer cancel()
+
+		err := p.deleteTXTValue(cleanupCtx, fqdn, value)
+		if err != nil {
+			log.Warn().
+				Err(err).
+				Str("fqdn", fqdn).
+				Msg("failed to clean up ACME challenge TXT record")
+
+			return
+		}
+
+		log.Info().
+			Str("fqdn", fqdn).
+			Msg("cleaned up ACME challenge TXT record")
+	}(ctx)
+}
+
+func (p *cloudflareProvider) deleteTXTValue(
+	ctx context.Context,
+	fqdn, value string,
+) error {
+	records, err := p.listTXTRecords(ctx, fqdn)
+	if err != nil {
+		return err
+	}
+
+	for _, rec := range records {
+		if rec.Content != value {
+			continue
+		}
+
+		err = p.deleteRecord(ctx, rec.ID)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // lookupTXTAt queries a specific DNS server for TXT records.
