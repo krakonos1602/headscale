@@ -6,13 +6,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/juanfont/headscale/hscontrol/types"
+	"github.com/rs/zerolog/log"
 )
 
 var (
@@ -22,13 +25,28 @@ var (
 	ErrCloudflareZoneMissing           = errors.New("cloudflare zone id is required")
 	ErrCloudflareCreateRecordFailed    = errors.New("cloudflare create record failed")
 	ErrCloudflareListRecordsFailed     = errors.New("cloudflare list records failed")
+	ErrCloudflareDeleteRecordFailed    = errors.New("cloudflare delete record failed")
+	ErrDNSPropagationTimeout           = errors.New("dns propagation timeout")
 )
 
 const (
-	cloudflareProviderName = "cloudflare"
-	defaultCloudflareAPI   = "https://api.cloudflare.com/client/v4"
-	defaultTXTTTLSeconds   = 120
+	cloudflareProviderName         = "cloudflare"
+	defaultCloudflareAPI           = "https://api.cloudflare.com/client/v4"
+	defaultTXTTTLSeconds           = 120
+	defaultPropagationTimeout      = 120 * time.Second
+	defaultPropagationPollInterval = 5 * time.Second
+	dnsLookupTimeout               = 10 * time.Second
 )
+
+// propagationResolvers are public DNS servers used to verify
+// that a TXT record is visible before returning from UpsertTXT.
+// We check multiple resolvers because Let's Encrypt may query any of them.
+var propagationResolvers = []string{
+	"1.1.1.1:53",
+	"1.0.0.1:53",
+	"8.8.8.8:53",
+	"8.8.4.4:53",
+}
 
 // ChallengeProvider creates and updates ACME DNS-01 TXT records.
 type ChallengeProvider interface {
@@ -92,12 +110,42 @@ func (p *cloudflareProvider) UpsertTXT(ctx context.Context, fqdn, value string) 
 		return err
 	}
 
+	// Check if the exact value already exists.
+	alreadyExists := false
 	for _, rec := range records {
 		if rec.Content == value {
-			return nil
+			alreadyExists = true
+
+			break
 		}
 	}
 
+	if !alreadyExists {
+		// Delete stale challenge TXT records to prevent accumulation.
+		for _, rec := range records {
+			delErr := p.deleteRecord(ctx, rec.ID)
+			if delErr != nil {
+				log.Warn().
+					Err(delErr).
+					Str("record_id", rec.ID).
+					Str("fqdn", fqdn).
+					Msg("failed to delete stale TXT record")
+			}
+		}
+
+		err = p.createTXTRecord(ctx, fqdn, value)
+		if err != nil {
+			return err
+		}
+	}
+
+	// Wait for DNS propagation before returning.
+	// The Tailscale client calls ACME Accept immediately after SetDNS returns,
+	// so the TXT record must be visible via public DNS at that point.
+	return p.waitForPropagation(ctx, fqdn, value)
+}
+
+func (p *cloudflareProvider) createTXTRecord(ctx context.Context, fqdn, value string) error {
 	createReq := map[string]any{
 		"type":    "TXT",
 		"name":    fqdn,
@@ -141,6 +189,10 @@ func (p *cloudflareProvider) UpsertTXT(ctx context.Context, fqdn, value string) 
 			cloudflareErrors(cfResp.Errors),
 		)
 	}
+
+	log.Info().
+		Str("fqdn", fqdn).
+		Msg("created ACME challenge TXT record")
 
 	return nil
 }
@@ -189,6 +241,106 @@ func (p *cloudflareProvider) endpoint(resource string) *url.URL {
 	u.Path = path.Join(p.apiBase.Path, "zones", p.zoneID, resource)
 
 	return &u
+}
+
+func (p *cloudflareProvider) deleteRecord(ctx context.Context, recordID string) error {
+	requestURL := p.endpoint("dns_records/" + recordID)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, requestURL.String(), nil)
+	if err != nil {
+		return fmt.Errorf("create cloudflare delete request: %w", err)
+	}
+
+	req.Header.Set("Authorization", "Bearer "+p.token)
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("calling cloudflare delete record: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		return fmt.Errorf(
+			"%w: status=%d record_id=%s",
+			ErrCloudflareDeleteRecordFailed,
+			resp.StatusCode,
+			recordID,
+		)
+	}
+
+	log.Debug().
+		Str("record_id", recordID).
+		Msg("deleted stale ACME challenge TXT record")
+
+	return nil
+}
+
+// waitForPropagation polls public DNS resolvers until the TXT record
+// is visible. This is critical because the Tailscale client calls
+// ACME Accept immediately after SetDNS returns — if the record is not
+// yet propagated, Let's Encrypt will reject the challenge.
+func (p *cloudflareProvider) waitForPropagation(
+	ctx context.Context,
+	fqdn, value string,
+) error {
+	log.Info().
+		Str("fqdn", fqdn).
+		Dur("timeout", defaultPropagationTimeout).
+		Msg("waiting for DNS propagation of ACME challenge TXT record")
+
+	deadline := time.Now().Add(defaultPropagationTimeout)
+
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		for _, server := range propagationResolvers {
+			found, err := lookupTXTAt(ctx, fqdn, server)
+			if err != nil {
+				continue
+			}
+
+			if slices.Contains(found, value) {
+				log.Info().
+					Str("fqdn", fqdn).
+					Str("resolver", server).
+					Msg("DNS propagation confirmed")
+
+				return nil
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(defaultPropagationPollInterval):
+		}
+	}
+
+	return fmt.Errorf(
+		"%w: TXT record %q not visible via public DNS after %s",
+		ErrDNSPropagationTimeout,
+		fqdn,
+		defaultPropagationTimeout,
+	)
+}
+
+// lookupTXTAt queries a specific DNS server for TXT records.
+func lookupTXTAt(ctx context.Context, fqdn, nameserver string) ([]string, error) {
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			d := net.Dialer{Timeout: dnsLookupTimeout}
+
+			return d.DialContext(ctx, "udp", nameserver)
+		},
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, dnsLookupTimeout)
+	defer cancel()
+
+	return resolver.LookupTXT(lookupCtx, fqdn)
 }
 
 type cloudflareResponse[T any] struct {
