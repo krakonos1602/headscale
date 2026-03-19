@@ -543,3 +543,52 @@ func TestDeleteApiKey_BothIdentifiers(t *testing.T) {
 	assert.Equal(t, codes.InvalidArgument, st.Code())
 	assert.Contains(t, st.Message(), "provide either id or prefix, not both")
 }
+
+// TestRenameNode_SendsSelfUpdate validates that RenameNode sets OriginNode on
+// the returned Change so the renamed node's tailscaled receives a self-update
+// MapResponse with the new GivenName (and thus the correct TLS cert domain).
+//
+// Regression test: without OriginNode, a node renamed via `headscale node rename`
+// kept rejecting TLS handshakes because tailscaled retained the old FQDN.
+func TestRenameNode_SendsSelfUpdate(t *testing.T) {
+	t.Parallel()
+
+	app := createTestApp(t)
+
+	user := app.state.CreateUserForTest("rename-test-user")
+
+	pak, err := app.state.CreatePreAuthKey(user.TypedID(), false, false, nil, nil)
+	require.NoError(t, err)
+
+	machineKey := key.NewMachine()
+	nodeKey := key.NewNode()
+
+	regReq := tailcfg.RegisterRequest{
+		Auth: &tailcfg.RegisterResponseAuth{
+			AuthKey: pak.Key,
+		},
+		NodeKey: nodeKey.Public(),
+		Hostinfo: &tailcfg.Hostinfo{
+			Hostname: "oldname",
+		},
+		Expiry: time.Now().Add(24 * time.Hour),
+	}
+
+	resp, err := app.handleRegisterWithAuthKey(regReq, machineKey.Public())
+	require.NoError(t, err)
+	require.True(t, resp.MachineAuthorized)
+
+	node, found := app.state.GetNodeByNodeKey(nodeKey.Public())
+	require.True(t, found)
+	require.Equal(t, "oldname", node.GivenName())
+	nodeID := node.ID()
+
+	nodeView, nodeChange, err := app.state.RenameNode(nodeID, "newname")
+	require.NoError(t, err)
+
+	assert.Equal(t, "newname", nodeView.GivenName())
+
+	// OriginNode must be set so the mapper sends a selfMapResponse to this node.
+	assert.Equal(t, nodeID, nodeChange.OriginNode,
+		"RenameNode must set OriginNode so the node receives its updated name")
+}

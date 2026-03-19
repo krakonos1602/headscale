@@ -889,7 +889,18 @@ func (s *State) RenameNode(nodeID types.NodeID, newName string) (types.NodeView,
 		return types.NodeView{}, change.Change{}, fmt.Errorf("%w: %d", ErrNodeNotInNodeStore, nodeID)
 	}
 
-	return s.persistNodeToDB(n)
+	nodeView, c, err := s.persistNodeToDB(n)
+	if err != nil {
+		return nodeView, c, err
+	}
+
+	// Set OriginNode so the renamed node receives a self-update MapResponse.
+	// Without this the node's tailscaled keeps the old GivenName and rejects
+	// TLS certs for the new hostname (the allowed-domain list derives from
+	// the Name field in the node's own MapResponse).
+	c.OriginNode = nodeID
+
+	return nodeView, c, nil
 }
 
 // BackfillNodeIPs assigns IP addresses to nodes that don't have them.

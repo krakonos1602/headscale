@@ -191,6 +191,7 @@ func (m *mapper) selfMapResponse(
 		WithDebugType(selfResponseDebug).
 		WithCapabilityVersion(capVer).
 		WithSelfNode().
+		WithDNSConfig().
 		Build()
 	if err != nil {
 		return nil, err
