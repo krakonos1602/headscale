@@ -1,0 +1,42 @@
+ARG GO_IMAGE=golang:1.26.1-trixie
+ARG RUNTIME_IMAGE=gcr.io/distroless/base-debian13
+
+FROM ${GO_IMAGE} AS builder
+
+ARG HEADSCALE_REPO=https://github.com/krakonos1602/headscale.git
+ARG HEADSCALE_COMMIT="66be1038accc9a28e7ae877c3ada3acd5cfae456"
+ARG TARGETOS=linux
+ARG TARGETARCH=amd64
+
+WORKDIR /src
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN test -n "${HEADSCALE_COMMIT}"
+
+RUN git init . \
+    && git remote add origin "${HEADSCALE_REPO}" \
+    && git fetch --depth 1 origin "${HEADSCALE_COMMIT}" \
+    && git checkout --detach FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${HEADSCALE_COMMIT}"
+
+RUN go mod download
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+    go build \
+    -trimpath \
+    -buildvcs=true \
+    -o /out/headscale \
+    ./cmd/headscale
+
+FROM ${RUNTIME_IMAGE}
+
+COPY --from=builder /out/headscale /ko-app/headscale
+
+WORKDIR /etc/headscale
+
+EXPOSE 8080
+
+ENTRYPOINT ["/ko-app/headscale"]
